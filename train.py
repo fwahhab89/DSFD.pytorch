@@ -1,5 +1,3 @@
-#-*- coding:utf-8 -*-
-
 from __future__ import division
 from __future__ import absolute_import
 from __future__ import print_function
@@ -8,9 +6,7 @@ import os
 import time
 import torch
 import argparse
-import torch.nn as nn
 import torch.optim as optim
-import torch.nn.init as init
 import torch.utils.data as data
 import numpy as np
 from torch.autograd import Variable
@@ -21,99 +17,105 @@ from layers.modules import MultiBoxLoss
 from data.widerface import WIDERDetection, detection_collate
 from models.factory import build_net, basenet_factory
 
-parser = argparse.ArgumentParser(
-    description='DSFD face Detector Training With Pytorch')
-train_set = parser.add_mutually_exclusive_group()
-parser.add_argument('--batch_size',
-                    default=16, type=int,
-                    help='Batch size for training')
-parser.add_argument('--model',
-                    default='vgg', type=str,
-                    choices=['vgg', 'resnet50', 'resnet101', 'resnet152'],
-                    help='model for training')
-parser.add_argument('--resume',
-                    default=None, type=str,
-                    help='Checkpoint state_dict file to resume training from')
-parser.add_argument('--num_workers',
-                    default=4, type=int,
-                    help='Number of workers used in dataloading')
-parser.add_argument('--cuda',
-                    default=True, type=bool,
-                    help='Use CUDA to train model')
-parser.add_argument('--lr', '--learning-rate',
-                    default=1e-3, type=float,
-                    help='initial learning rate')
-parser.add_argument('--momentum',
-                    default=0.9, type=float,
-                    help='Momentum value for optim')
-parser.add_argument('--weight_decay',
-                    default=5e-4, type=float,
-                    help='Weight decay for SGD')
-parser.add_argument('--gamma',
-                    default=0.1, type=float,
-                    help='Gamma update for SGD')
-parser.add_argument('--multigpu',
-                    default=False, type=bool,
-                    help='Use mutil Gpu training')
-parser.add_argument('--save_folder',
-                    default='weights/',
-                    help='Directory for saving checkpoint models')
-args = parser.parse_args()
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='DSFD face Detector Training With Pytorch')
+    parser.add_argument('--batch_size',
+                        default=16, type=int,
+                        help='Batch size for training')
+    parser.add_argument('--model',
+                        default='vgg', type=str,
+                        choices=['vgg', 'resnet50', 'resnet101', 'resnet152'],
+                        help='model for training')
+    parser.add_argument('--resume',
+                        default=None, type=str,
+                        help='Checkpoint state_dict file to resume training from')
+    parser.add_argument('--num_workers',
+                        default=4, type=int,
+                        help='Number of workers used in dataloading')
+    parser.add_argument('--cuda',
+                        default=True, type=bool,
+                        help='Use CUDA to train model')
+    parser.add_argument('--lr', '--learning-rate',
+                        default=1e-3, type=float,
+                        help='initial learning rate')
+    parser.add_argument('--momentum',
+                        default=0.9, type=float,
+                        help='Momentum value for optim')
+    parser.add_argument('--weight_decay',
+                        default=5e-4, type=float,
+                        help='Weight decay for SGD')
+    parser.add_argument('--gamma',
+                        default=0.1, type=float,
+                        help='Gamma update for SGD')
+    parser.add_argument('--multigpu',
+                        default=False, type=bool,
+                        help='Use mutil Gpu training')
+    parser.add_argument('--save_folder',
+                        default='weights/',
+                        help='Directory for saving checkpoint models')
+    args = parser.parse_args()
+    return args
 
-if not args.multigpu:
-    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+def main(args):
 
-if torch.cuda.is_available():
-    if args.cuda:
-        torch.set_default_tensor_type('torch.cuda.FloatTensor')
-    if not args.cuda:
-        print("WARNING: It looks like you have a CUDA device, but aren't " +
+    # check for multiple gpus
+    if not args.multigpu:
+        os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+
+    # check whether cuda available or not
+    if torch.cuda.is_available():
+        if args.cuda:
+            torch.set_default_tensor_type('torch.cuda.FloatTensor')
+        if not args.cuda:
+            print("WARNING: It looks like you have a CUDA device, but aren't " +
               "using CUDA.\nRun with --cuda for optimal training speed.")
+            torch.set_default_tensor_type('torch.FloatTensor')
+    else:
         torch.set_default_tensor_type('torch.FloatTensor')
-else:
-    torch.set_default_tensor_type('torch.FloatTensor')
 
 
-save_folder = os.path.join(args.save_folder, args.model)
-if not os.path.exists(save_folder):
-    os.mkdir(save_folder)
+    # create saving directory for checkpoints
+    save_folder = os.path.join(args.save_folder, args.model)
+    if not os.path.exists(save_folder):
+        os.mkdir(save_folder)
 
 
-train_dataset = WIDERDetection(cfg.FACE.TRAIN_FILE, mode='train')
+    # define the datasets and data loaders
+    train_dataset = WIDERDetection(cfg.FACE.TRAIN_FILE, mode='train')
+    val_dataset = WIDERDetection(cfg.FACE.VAL_FILE, mode='val')
 
-val_dataset = WIDERDetection(cfg.FACE.VAL_FILE, mode='val')
-
-train_loader = data.DataLoader(train_dataset, args.batch_size,
+    train_loader = data.DataLoader(train_dataset, args.batch_size,
                                num_workers=args.num_workers,
                                shuffle=True,
                                collate_fn=detection_collate,
                                pin_memory=True)
-val_batchsize = args.batch_size // 2
-val_loader = data.DataLoader(val_dataset, val_batchsize,
+    val_batchsize = args.batch_size // 2
+    val_loader = data.DataLoader(val_dataset, val_batchsize,
                              num_workers=args.num_workers,
                              shuffle=False,
                              collate_fn=detection_collate,
                              pin_memory=True)
 
 
-min_loss = np.inf
+    min_loss = np.inf
 
-
-def train():
     per_epoch_size = len(train_dataset) // args.batch_size
     start_epoch = 0
     iteration = 0
     step_index = 0
 
+    # define the model
     basenet = basenet_factory(args.model)
     dsfd_net = build_net('train', cfg.NUM_CLASSES, args.model)
     net = dsfd_net
 
+    # check whether to resume from a previous checkpoint or not
     if args.resume:
         print('Resuming training, loading {}...'.format(args.resume))
         start_epoch = net.load_weights(args.resume)
         iteration = start_epoch * per_epoch_size
-    else:
+
         base_weights = torch.load(args.save_folder + basenet)
         print('Load base network {}'.format(args.save_folder + basenet))
         if args.model == 'vgg':
@@ -121,14 +123,16 @@ def train():
         else:
             net.resnet.load_state_dict(base_weights)
 
+    # if cuda available and if multiple gpus available
     if args.cuda:
         if args.multigpu:
             net = torch.nn.DataParallel(dsfd_net)
         net = net.cuda()
         cudnn.benckmark = True
 
+    # randomly initialize the model
     if not args.resume:
-        print('Initializing weights...')
+        print('Randomly initializing weights for the described DSFD Model...')
         dsfd_net.extras.apply(dsfd_net.weights_init)
         dsfd_net.fpn_topdown.apply(dsfd_net.weights_init)
         dsfd_net.fpn_latlayer.apply(dsfd_net.weights_init)
@@ -137,6 +141,7 @@ def train():
         dsfd_net.conf_pal1.apply(dsfd_net.weights_init)
         dsfd_net.loc_pal2.apply(dsfd_net.weights_init)
         dsfd_net.conf_pal2.apply(dsfd_net.weights_init)
+
 
     optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=args.momentum,
                           weight_decay=args.weight_decay)
@@ -254,4 +259,4 @@ def adjust_learning_rate(optimizer, gamma, step):
 
 
 if __name__ == '__main__':
-    train()
+    main(parse_args())
