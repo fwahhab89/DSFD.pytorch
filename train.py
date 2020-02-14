@@ -57,6 +57,69 @@ def parse_args():
     args = parser.parse_args()
     return args
 
+
+def train(net, criterion, train_loader, optimizer, epoch, iteration, step_index, gamma, device):
+    net.train()
+    losses = 0
+    for batch_idx, (images, targets) in enumerate(train_loader):
+        images = Variable(images.cuda())
+        targets = [Variable(ann.cuda(), volatile=True)for ann in targets]
+
+        if iteration in cfg.LR_STEPS:
+            step_index += 1
+            adjust_learning_rate(optimizer, gamma, step_index)
+
+        t0 = time.time()
+        out = net(images)
+
+        # backprop
+        optimizer.zero_grad()
+        loss_l_pa1l, loss_c_pal1 = criterion(out[:3], targets)
+        loss_l_pa12, loss_c_pal2 = criterion(out[3:], targets)
+
+        loss = loss_l_pa1l + loss_c_pal1 + loss_l_pa12 + loss_c_pal2
+        loss.backward()
+        optimizer.step()
+        t1 = time.time()
+        losses += loss.data[0]
+
+        if iteration % 10 == 0:
+            tloss = losses / (batch_idx + 1)
+            print('Timer: %.4f' % (t1 - t0))
+            print('epoch:' + repr(epoch) + ' || iter:' +
+                  repr(iteration) + ' || Loss:%.4f' % (tloss))
+            print('->> pal1 conf loss:{:.4f} || pal1 loc loss:{:.4f}'.format(
+                loss_c_pal1.data[0], loss_l_pa1l.data[0]))
+            print('->> pal2 conf loss:{:.4f} || pal2 loc loss:{:.4f}'.format(
+                loss_c_pal2.data[0], loss_l_pa12.data[0]))
+            print('->>lr:{}'.format(optimizer.param_groups[0]['lr']))
+    return losses/(batch_idx +1), iteration, step_index
+
+def validate(net, criterion, val_loader, epoch):
+    net.eval()
+    step = 0
+    losses = 0
+    t1 = time.time()
+
+    for batch_idx, (images, targets) in enumerate(val_loader):
+        images = Variable(images.cuda())
+        targets = [Variable(ann.cuda(), volatile=True)
+                    for ann in targets]
+
+        out = net(images)
+        loss_l_pa1l, loss_c_pal1 = criterion(out[:3], targets)
+        loss_l_pa12, loss_c_pal2 = criterion(out[3:], targets)
+        loss = loss_l_pa12 + loss_c_pal2
+        losses += loss.data[0]
+        step += 1
+
+    tloss = losses / step
+    t2 = time.time()
+    print('Timer: %.4f' % (t2 - t1))
+    print('test epoch:' + repr(epoch) + ' || Loss:%.4f' % (tloss))
+
+    return tloss
+
 def main(args):
 
     # check for multiple gpus
@@ -142,7 +205,7 @@ def main(args):
         dsfd_net.loc_pal2.apply(dsfd_net.weights_init)
         dsfd_net.conf_pal2.apply(dsfd_net.weights_init)
 
-
+    # define the optimizer and loss criteria
     optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=args.momentum,
                           weight_decay=args.weight_decay)
     criterion = MultiBoxLoss(cfg, args.cuda)
@@ -150,101 +213,34 @@ def main(args):
     print('Using the specified args:')
     print(args)
 
+
+    # taking care of the learning scheduler
     for step in cfg.LR_STEPS:
         if iteration > step:
             step_index += 1
             adjust_learning_rate(optimizer, args.gamma, step_index)
 
-    net.train()
+
     for epoch in range(start_epoch, cfg.EPOCHES):
-        losses = 0
-        for batch_idx, (images, targets) in enumerate(train_loader):
-            if args.cuda:
-                images = Variable(images.cuda())
-                targets = [Variable(ann.cuda(), volatile=True)
-                           for ann in targets]
-            else:
-                images = Variable(images)
-                targets = [Variable(ann, volatile=True) for ann in targets]
+        train_loss, iteration, step_index = train(net, criterion, train_loader, optimizer, epoch,
+                                                  iteration, step_index, args.gamma, device=None)
 
-            if iteration in cfg.LR_STEPS:
-                step_index += 1
-                adjust_learning_rate(optimizer, args.gamma, step_index)
+        val_loss = validate(net, criterion, val_loader, epoch)
 
-            t0 = time.time()
-            out = net(images)
-            # backprop
-            optimizer.zero_grad()
-            loss_l_pa1l, loss_c_pal1 = criterion(out[:3], targets)
-            loss_l_pa12, loss_c_pal2 = criterion(out[3:], targets)
+        # validation loss less than the previous one, save the better checkpoint
+        if val_loss  < min_loss:
+            print('Saving best state,epoch', epoch)
+            torch.save(dsfd_net.state_dict(), os.path.join(
+                save_folder, 'dsfd.pth'))
+            min_loss = val_loss
 
-            loss = loss_l_pa1l + loss_c_pal1 + loss_l_pa12 + loss_c_pal2
-            loss.backward()
-            optimizer.step()
-            t1 = time.time()
-            losses += loss.data[0]
-
-            if iteration % 10 == 0:
-                tloss = losses / (batch_idx + 1)
-                print('Timer: %.4f' % (t1 - t0))
-                print('epoch:' + repr(epoch) + ' || iter:' +
-                      repr(iteration) + ' || Loss:%.4f' % (tloss))
-                print('->> pal1 conf loss:{:.4f} || pal1 loc loss:{:.4f}'.format(
-                    loss_c_pal1.data[0], loss_l_pa1l.data[0]))
-                print('->> pal2 conf loss:{:.4f} || pal2 loc loss:{:.4f}'.format(
-                    loss_c_pal2.data[0], loss_l_pa12.data[0]))
-                print('->>lr:{}'.format(optimizer.param_groups[0]['lr']))
-
-            if iteration != 0 and iteration % 5000 == 0:
-                print('Saving state, iter:', iteration)
-                file = 'dsfd_' + repr(iteration) + '.pth'
-                torch.save(dsfd_net.state_dict(),
-                           os.path.join(save_folder, file))
-            iteration += 1
-
-        val(epoch, net, dsfd_net, criterion)
+        states = {
+            'epoch': epoch,
+            'weight': dsfd_net.state_dict(),
+        }
+        torch.save(states, os.path.join(save_folder, 'dsfd_checkpoint.pth'))
         if iteration == cfg.MAX_STEPS:
             break
-
-
-def val(epoch, net, dsfd_net, criterion):
-    net.eval()
-    step = 0
-    losses = 0
-    t1 = time.time()
-    for batch_idx, (images, targets) in enumerate(val_loader):
-        if args.cuda:
-            images = Variable(images.cuda())
-            targets = [Variable(ann.cuda(), volatile=True)
-                       for ann in targets]
-        else:
-            images = Variable(images)
-            targets = [Variable(ann, volatile=True) for ann in targets]
-
-        out = net(images)
-        loss_l_pa1l, loss_c_pal1 = criterion(out[:3], targets)
-        loss_l_pa12, loss_c_pal2 = criterion(out[3:], targets)
-        loss = loss_l_pa12 + loss_c_pal2
-        losses += loss.data[0]
-        step += 1
-
-    tloss = losses / step
-    t2 = time.time()
-    print('Timer: %.4f' % (t2 - t1))
-    print('test epoch:' + repr(epoch) + ' || Loss:%.4f' % (tloss))
-
-    global min_loss
-    if tloss < min_loss:
-        print('Saving best state,epoch', epoch)
-        torch.save(dsfd_net.state_dict(), os.path.join(
-            save_folder, 'dsfd.pth'))
-        min_loss = tloss
-
-    states = {
-        'epoch': epoch,
-        'weight': dsfd_net.state_dict(),
-    }
-    torch.save(states, os.path.join(save_folder, 'dsfd_checkpoint.pth'))
 
 
 def adjust_learning_rate(optimizer, gamma, step):
